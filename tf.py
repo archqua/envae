@@ -57,27 +57,6 @@ def mixture_logp(samples, means, logvars, weights=None):
     )
 
 
-def mixture_klde_fn(envae):
-
-    def mixture_klde(means, logvars, kind="mc"):
-        kind = kind.lower()
-        if kind == "mc":
-            z = envae.reparameterize(means, logvars)
-
-            def wrapped():
-                logpz = standard_logp(z)
-                logpz_x = mixture_logp(z, means, logvars)
-                return -tf.reduce_mean(logpz - logpz_x)
-
-            return wrapped
-        else:
-            raise NotImplementedError(
-                f"{kind}-KL divergence estimation is not implemented"
-            )
-
-    return mixture_klde_fn
-
-
 T = TypeVar("T")
 ListLike[T] = Union[List[T], Tuple[T]]
 
@@ -85,6 +64,7 @@ ListLike[T] = Union[List[T], Tuple[T]]
 class EnVAE(tf.keras.Model):
     """[EnVAE](link) tensorflow implementation."""
 
+    # TODO parameterize N layers to allow linear EnVAE
     def __init__(
         self,
         obs_dim: int,
@@ -165,13 +145,13 @@ class EnVAE(tf.keras.Model):
                     f"`reg` must be `None`, `str` or `tuple`, not {type(reg)}"
                 )
 
+        # TODO use functional api to specify inputs and outputs everywhere
         # initialize encoders
         self.encoders = {
             k: tf.keras.Sequential(
                 [
                     tf.keras.InputLayer(input_shape=(len(self._groups[k]),)),
-                    # should it be units=2*lat_dim ?
-                    tf.keras.Dense(units=lat_dim, kernel_regularizer=getreg()),
+                    tf.keras.Dense(units=2 * lat_dim, kernel_regularizer=getreg()),
                     tf.keras.ReLU(),
                     tf.keras.Dense(units=2 * lat_dim, kernel_regularizer=getreg()),
                 ]
@@ -192,14 +172,14 @@ class EnVAE(tf.keras.Model):
         }
 
         @property
-        def groups(self) -> Optional[Dict[Any, ListLike[int]]]:
+        def groups(self) -> Dict[Any, ListLike[int]]:
             return deepcopy(self._groups)
 
         @tf.function
         def sample(self, epsilon: tf.Tensor) -> tf.Tensor:
             return self.decode(epsilon)
 
-        def encode(self, X: tf.Tensor) -> tf.Tensor:
+        def encode(self, X: tf.Tensor, asdict=False) -> tf.Tensor:
             means = dict()
             logvars = dict()
             for g, encoder in self.encoders.items():
@@ -210,9 +190,12 @@ class EnVAE(tf.keras.Model):
                 )
                 means[g] = mean
                 logvars[g] = logvar
-            return means, logvars
+            if asdict:
+                return means, logvars
+            else:
+                return tf.stack(means.values()), tf.stack(logvars.values())
 
-        def reparameterize(self, means, logvars):
+        def reparameterize(self, means: tf.Tensor, logvars: tf.Tensor) -> tf.Tensor:
             # means, logvar -> [Batch, Hidden, Mixture]
             eps = tf.random.normal(shape=means.shape[:-1])
             indices = tf.cast(
@@ -228,3 +211,24 @@ class EnVAE(tf.keras.Model):
             return tf.boolean_mask(means, mask) + eps * tf.exp(
                 0.5 * tf.boolean_mask(logvars, mask)
             )
+
+
+def mixture_klde_fn(envae: EnVAE):
+
+    def mixture_klde(means: tf.Tensor, logvars: tf.Tensor, kind: str = "mc"):
+        kind = kind.lower()
+        if kind == "mc":
+            z = envae.reparameterize(means, logvars)
+
+            def wrapped():
+                logpz = standard_logp(z)
+                logpz_x = mixture_logp(z, means, logvars)
+                return -tf.reduce_mean(logpz - logpz_x)
+
+            return wrapped
+        else:
+            raise NotImplementedError(
+                f"{kind} KL divergence estimation is not implemented"
+            )
+
+    return mixture_klde_fn
