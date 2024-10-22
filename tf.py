@@ -71,7 +71,7 @@ class EnVAE(tf.keras.Model):
         lat_dim: int,
         depth: int = 2,
         groups: Union[None, Dict[Any, ListLike[int]], ListLike[int]] = None,
-        ngroups: int = 2,
+        ngroups: Optional[int] = 2,
         reg: Union[
             None,
             str,
@@ -217,7 +217,7 @@ class EnVAE(tf.keras.Model):
     def sample(self, epsilon: tf.Tensor) -> tf.Tensor:
         return self.decode(epsilon)
 
-    def encode(self, X: tf.Tensor, asdict=False) -> tf.Tensor:
+    def encode(self, X: tf.Tensor, asdict: bool = False) -> tf.Tensor:
         means = dict()
         logvars = dict()
         for g, encoder in self.encoders.items():
@@ -252,6 +252,7 @@ class EnVAE(tf.keras.Model):
         if not asdict:
             means = tf.stack(list(means.values()), axis=2)
             logvars = tf.stack(list(logvars.values()), axis=2)
+            return self.mopoe(means, logvars)
         return means, logvars
 
     def mopoe(
@@ -293,33 +294,42 @@ class EnVAE(tf.keras.Model):
         return m_means, m_logvars
 
     def reparameterize(self, means: tf.Tensor, logvars: tf.Tensor) -> tf.Tensor:
-        # means, logvars -> [Batch, Hidden, Groups]
-        m_means, m_logvars = self.mopoe(means, logvars)
-        # m_means, m_logvars -> [Batch, Hidden, Mixture = 2**Groups - 1]
+        # means, logvars -> [Batch, Hidden, Mixture = 2**Groups - 1]
         eps = tf.random.normal(shape=means.shape[:-1])
         # indices are the same across latent space
         # differ only across batch
         indices = tf.cast(
             tf.math.floor(
-                tf.random.uniform(m_means.shape[:1], 0.0, float(m_means.shape[-1]))
+                tf.random.uniform(means.shape[:1], 0.0, float(means.shape[-1]))
             ),
             tf.int32,
         )
         mask = (
             indices[:, tf.newaxis, tf.newaxis]
-            == tf.range(m_means.shape[-1])[tf.newaxis, tf.newaxis, :]
+            == tf.range(means.shape[-1])[tf.newaxis, tf.newaxis, :]
         )
-        mask = tf.broadcast_to(mask, m_means.shape)
-        sample_mean = tf.reshape(tf.boolean_mask(m_means, mask), means.shape[:-1])
+        mask = tf.broadcast_to(mask, means.shape)
+        sample_mean = tf.reshape(tf.boolean_mask(means, mask), means.shape[:-1])
         sample_delta = eps * tf.exp(
-            0.5 * tf.reshape(tf.boolean_mask(m_logvars, mask), logvars.shape[:-1])
+            0.5 * tf.reshape(tf.boolean_mask(logvars, mask), logvars.shape[:-1])
         )
         return sample_mean + sample_delta
 
     def decode(self, z: tf.Tensor) -> tf.Tensor:
-        res = tf.empty((z.shape[0], self._obs_dim))
-        # TODO
-        pass
+        res = tf.zeros((z.shape[0], self._obs_dim), dtype=tf.float32)
+        # tf.scatter_nd moment
+        res = tf.transpose(res)
+        for gn, gis in self._groups.items():
+            decoded = self.decoders[gn](z)
+            # tf.scatter_nd moment
+            decoded = tf.transpose(decoded)
+            res += tf.scatter_nd(
+                gis[:, tf.newaxis],
+                decoded,
+                res.shape,
+            )
+        res = tf.transpose(res)
+        return res
 
 
 def mixture_klde_fn(envae: EnVAE):
