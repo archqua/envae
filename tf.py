@@ -1,25 +1,25 @@
 from copy import deepcopy
 from itertools import chain, combinations
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
 import tensorflow as tf
 
 
-def powerset(iterable):
+def powerset(iterable, lo=1):
     s = list(iterable)
-    return chain.from_iterable(combinations(s, r) for r in range(len(s) + 1))
+    return chain.from_iterable(combinations(s, r) for r in range(lo, len(s) + 1))
 
 
 def poe(means, logvars, normalize_outp=True, eps=1e-08):
     taus = tf.exp(-logvars)
     if normalize_outp:
-        tau = taus.sum() + 1
-        mean = (taus * means).sum() / tau
+        tau = tf.math.reduce_sum(taus, axis=-1) + 1
+        mean = tf.math.reduce_sum(taus * means, axis=-1) / tau
     else:
-        tau = taus.sum() + eps
-        mean = (taus * means).sum() / tau
-    return mean, tf.log(1 / tau)
+        tau = tf.math.reduce_sum(taus, axis=-1) + eps
+        mean = tf.math.reduce_sum(taus * means, axis=-1) / tau
+    return mean, tf.math.log(1 / tau)
 
 
 def standard_logp(samples, axis=-1):
@@ -58,7 +58,7 @@ def mixture_logp(samples, means, logvars, weights=None):
 
 
 T = TypeVar("T")
-ListLike[T] = Union[List[T], Tuple[T]]
+type ListLike[T] = Union[List[T], Tuple[T]]
 
 
 class EnVAE(tf.keras.Model):
@@ -69,36 +69,48 @@ class EnVAE(tf.keras.Model):
         self,
         obs_dim: int,
         lat_dim: int,
+        depth: int = 2,
+        groups: Union[None, Dict[Any, ListLike[int]], ListLike[int]] = None,
+        ngroups: int = 2,
         reg: Union[
             None,
             str,
             Tuple[str, float],
             tf.keras.Regularizer,
         ] = ("l2", 1e-03),
-        groups: Union[None, Dict[Any, ListLike[int]], ListLike[int]] = None,
-        ngroups: int = 2,
     ):
         super().__init__()
+        self._obs_dim = obs_dim
+        self._lat_dim = lat_dim
         # initialize and check groups
         if isinstance(groups, (list, tuple)):
             if len(groups < 1):
                 raise ValueError(
                     f"`groups: list = {groups}` has length {len(groups)}, must be >=1"
                 )
-            groups = {i: groups[i] for i in range(len(groups))}
+            groups = {
+                i: tf.constant(groups[i], dtype=tf.int32) for i in range(len(groups))
+            }
         self._groups = deepcopy(groups)
         if self._groups is None:
             if obs_dim < ngroups:
                 raise ValueError("`groups` is not specified and `ngroups` > `obs_dim`")
             self._groups = {
-                n: [i for i in range(obs_dim) if i % ngroups == n]
+                n: tf.constant(
+                    [i for i in range(obs_dim) if i % ngroups == n],
+                    dtype=tf.int32,
+                )
                 for n in range(ngroups)
+            }
+        else:
+            self._groups = {
+                k: tf.constant(v, dtype=tf.int32) for k, v in groups.items()
             }
         gks = list(self._groups.keys())
         for i in range(len(self._groups)):
-            gi = self._groups[gks[i]]
-            for j in range(i, len(self._groups)):
-                gj = self._groups[gks[j]]
+            gi = self._groups[gks[i]].numpy()
+            for j in range(i + 1, len(self._groups)):
+                gj = self._groups[gks[j]].numpy()
                 if len(set(gi) & set(gj)) > 0:
                     raise ValueError(
                         f"`groups` has intersecting groups: {gi} & {gj} == {set(gi) & set(gj)}"
@@ -150,10 +162,23 @@ class EnVAE(tf.keras.Model):
         self.encoders = {
             k: tf.keras.Sequential(
                 [
-                    tf.keras.InputLayer(input_shape=(len(self._groups[k]),)),
-                    tf.keras.Dense(units=2 * lat_dim, kernel_regularizer=getreg()),
-                    tf.keras.ReLU(),
-                    tf.keras.Dense(units=2 * lat_dim, kernel_regularizer=getreg()),
+                    tf.keras.layers.InputLayer(shape=(len(self._groups[k]),)),
+                ]
+                + [
+                    tf.keras.layers.Dense(
+                        units=2 * lat_dim,
+                        kernel_regularizer=getreg(),
+                        activation="relu",
+                        name=f"{k}_enc_dense_{d}",
+                    )
+                    for d in range(depth - 1)
+                ]
+                + [
+                    tf.keras.layers.Dense(
+                        units=2 * lat_dim,
+                        kernel_regularizer=getreg(),
+                        name=f"{k}_enc_dense_{depth-1}",
+                    ),
                 ]
             )
             for k in self._groups
@@ -162,55 +187,139 @@ class EnVAE(tf.keras.Model):
         self.decoders = {
             k: tf.keras.Sequential(
                 [
-                    tf.keras.InputLayer(input_shape=(lat_dim,)),
-                    tf.keras.Dense(units=lat_dim),
-                    tf.keras.ReLU(),
-                    tf.keras.Dense(units=len(self._groups[k])),
+                    tf.keras.layers.InputLayer(shape=(lat_dim,)),
+                ]
+                + [
+                    tf.keras.layers.Dense(
+                        units=lat_dim,
+                        kernel_regularizer=getreg(),
+                        activation="relu",
+                        name=f"{k}_dec_dense_{d}",
+                    )
+                    for d in range(depth - 1)
+                ]
+                + [
+                    tf.keras.layers.Dense(
+                        units=len(self._groups[k]),
+                        kernel_regularizer=getreg(),
+                        name=f"{k}_dec_dense_{depth-1}",
+                    ),
                 ]
             )
             for k in self._groups
         }
 
-        @property
-        def groups(self) -> Dict[Any, ListLike[int]]:
-            return deepcopy(self._groups)
+    @property
+    def groups(self) -> Dict[Any, ListLike[int]]:
+        return deepcopy(self._groups)
 
-        @tf.function
-        def sample(self, epsilon: tf.Tensor) -> tf.Tensor:
-            return self.decode(epsilon)
+    @tf.function
+    def sample(self, epsilon: tf.Tensor) -> tf.Tensor:
+        return self.decode(epsilon)
 
-        def encode(self, X: tf.Tensor, asdict=False) -> tf.Tensor:
-            means = dict()
-            logvars = dict()
-            for g, encoder in self.encoders.items():
-                mean, logvar = tf.split(
-                    encoder(X[:, self._groups[g]]),
-                    num_or_size_splits=2,
-                    axis=1,
-                )
-                means[g] = mean
-                logvars[g] = logvar
-            if asdict:
-                return means, logvars
-            else:
-                return tf.stack(means.values()), tf.stack(logvars.values())
-
-        def reparameterize(self, means: tf.Tensor, logvars: tf.Tensor) -> tf.Tensor:
-            # means, logvar -> [Batch, Hidden, Mixture]
-            eps = tf.random.normal(shape=means.shape[:-1])
-            indices = tf.cast(
-                tf.math.floor(
-                    tf.random.uniform(means.shape[:-1], 0.0, float(means.shape[-1]))
+    def encode(self, X: tf.Tensor, asdict=False) -> tf.Tensor:
+        means = dict()
+        logvars = dict()
+        for g, encoder in self.encoders.items():
+            mean, logvar = tf.split(
+                # encoder(X[:, self._groups[g]]),
+                # tensorflow moment
+                encoder(
+                    tf.gather_nd(
+                        X,
+                        tf.stack(
+                            [
+                                tf.repeat(
+                                    tf.range(X.shape[0])[:, tf.newaxis],
+                                    self._groups[0].shape[0],
+                                    axis=1,
+                                ),
+                                tf.repeat(
+                                    self._groups[0][tf.newaxis, :],
+                                    X.shape[0],
+                                    axis=0,
+                                ),
+                            ],
+                            axis=2,
+                        ),
+                    ),
                 ),
-                tf.int32,
+                num_or_size_splits=2,
+                axis=1,
             )
-            mask = (
-                indices[:, :, tf.newaxis]
-                == tf.range(means.shape[:-1])[tf.newaxis, tf.newaxis, :]
+            means[g] = mean
+            logvars[g] = logvar
+        if not asdict:
+            means = tf.stack(list(means.values()), axis=2)
+            logvars = tf.stack(list(logvars.values()), axis=2)
+        return means, logvars
+
+    def mopoe(
+        self, means: tf.Tensor, logvars: tf.Tensor
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        # means, logvar -> [Batch, Hidden, Groups]
+        # discrete uniform sampling -- MoE
+        ngroups = means.shape[-1]
+        # creating mixtures
+        m_means = []
+        m_logvars = []
+        for experts in powerset(range(means.shape[-1])):
+            # tensorflow moment
+            req_means = tf.gather_nd(
+                means,
+                tf.constant(
+                    [
+                        [[[b, h, g] for g in experts] for h in range(means.shape[1])]
+                        for b in range(means.shape[0])
+                    ],
+                    dtype=tf.int32,
+                ),
             )
-            return tf.boolean_mask(means, mask) + eps * tf.exp(
-                0.5 * tf.boolean_mask(logvars, mask)
+            req_logvars = tf.gather_nd(
+                logvars,
+                tf.constant(
+                    [
+                        [[[b, h, g] for g in experts] for h in range(logvars.shape[1])]
+                        for b in range(logvars.shape[0])
+                    ],
+                    dtype=tf.int32,
+                ),
             )
+            p_mean, p_logvar = poe(req_means, req_logvars)
+            m_means.append(p_mean)
+            m_logvars.append(p_logvar)
+        m_means = tf.stack(m_means, axis=-1)
+        m_logvars = tf.stack(m_logvars, axis=-1)
+        return m_means, m_logvars
+
+    def reparameterize(self, means: tf.Tensor, logvars: tf.Tensor) -> tf.Tensor:
+        # means, logvars -> [Batch, Hidden, Groups]
+        m_means, m_logvars = self.mopoe(means, logvars)
+        # m_means, m_logvars -> [Batch, Hidden, Mixture = 2**Groups - 1]
+        eps = tf.random.normal(shape=means.shape[:-1])
+        # indices are the same across latent space
+        # differ only across batch
+        indices = tf.cast(
+            tf.math.floor(
+                tf.random.uniform(m_means.shape[:1], 0.0, float(m_means.shape[-1]))
+            ),
+            tf.int32,
+        )
+        mask = (
+            indices[:, tf.newaxis, tf.newaxis]
+            == tf.range(m_means.shape[-1])[tf.newaxis, tf.newaxis, :]
+        )
+        mask = tf.broadcast_to(mask, m_means.shape)
+        sample_mean = tf.reshape(tf.boolean_mask(m_means, mask), means.shape[:-1])
+        sample_delta = eps * tf.exp(
+            0.5 * tf.reshape(tf.boolean_mask(m_logvars, mask), logvars.shape[:-1])
+        )
+        return sample_mean + sample_delta
+
+    def decode(self, z: tf.Tensor) -> tf.Tensor:
+        res = tf.empty((z.shape[0], self._obs_dim))
+        # TODO
+        pass
 
 
 def mixture_klde_fn(envae: EnVAE):
